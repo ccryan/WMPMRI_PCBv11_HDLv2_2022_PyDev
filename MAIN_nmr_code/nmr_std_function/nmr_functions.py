@@ -11,6 +11,8 @@ from nmr_std_function.data_parser import convert_to_prospa_data_t1
 from nmr_std_function.signal_proc import down_conv, nmr_fft, butter_lowpass_filter
 import numpy as np
 
+import adaptfilt as adf
+import padasip as pa
 
 def plot_echosum( nmrObj, filepath, samples_per_echo, echoes_per_scan, en_fig ):
 
@@ -62,10 +64,7 @@ def compute_multiexp( nmrObj, phenc_conf, expt_num, sav_fig, show_fig):
     ignore_echoes = phenc_conf.ignore_echoes
     a_est = phenc_conf.a_est
     t2_est = phenc_conf.t2_est
-    a_bnd = phenc_conf.a_bnd
-    t2_bnd = phenc_conf.t2_bnd
     dconv_f = phenc_conf.dconv_f
-    sel_adc_ch = phenc_conf.sel_adc_ch
     
     # spectrum reference
     en_spect_ref = phenc_conf.en_spect_ref
@@ -79,6 +78,7 @@ def compute_multiexp( nmrObj, phenc_conf, expt_num, sav_fig, show_fig):
     binary_OR_ascii = True # put 1 if the data file uses binary representation, otherwise it is in ascii format
     float_OR_int32 = True # put 1 if the data file uses float representation, otherwise it is in int32 format
     unit__uvolt_or_digit = False # set to 0 of ADC digit unit, or 1 for microvolt unit for all the plot
+    sel_adc_ch = 0 # select the adc channel # for NMR to be processed
     
     sav_indv_dat = False # save individual computed data
     sav_as_pdf = False # save the data as a pdf file
@@ -219,7 +219,506 @@ def compute_multiexp( nmrObj, phenc_conf, expt_num, sav_fig, show_fig):
         data_parser.write_text_append_row( data_folder, "\\echo_avg.txt", tacq )
 
 
-    # filter the data (down conversion)
+    # filter the data
+    data_filt = np.zeros( ( NoE, SpE ), dtype = complex )
+    for i in range( 0, NoE ):
+        data_filt[i, :] = down_conv( data[i * SpE:( i + 1 ) * SpE], i, tE, Df, Sf, dconv_lpf_ord, dconv_lpf_cutoff_kHz * 1e3 )
+
+    # scan rotation
+    if en_ext_rotation:
+        data_filt = data_filt * np.exp( -1j * thetaref )
+        theta = math.atan2( np.sum( np.imag( data_filt[ignore_echoes:,:] ) ),
+                           np.sum( np.real( data_filt[ignore_echoes:,:] ) ) )
+    else: # calculate theta. If necessary, perform self-rotation.
+        theta = math.atan2( np.sum( np.imag( data_filt[ignore_echoes:,:] ) ),
+                           np.sum( np.real( data_filt[ignore_echoes:,:] ) ) )
+        if en_self_rotation:
+            data_filt = data_filt * np.exp( -1j * theta )
+
+    if sav_fig:  # plot filtered data
+        echo_space = ( 1 / Sf ) * np.linspace( 1, SpE, SpE )  # in s
+        plt.figure( 2 )
+        plt.clf()
+        
+        if sav_indv_dat:
+            data_parser.write_text_overwrite( data_folder, "\\decay_filt.txt", "settings: NoE: %d, SpE: %d, tE: %0.2f, fs: %0.2f. Format: re(echo1), im(echo1), re(echo2), im(echo2), ... " % ( NoE, SpE, tE, Sf ) )
+
+        for i in range( 0, NoE ):
+            plt.plot( ( i * tE * 1e-6 + echo_space ) * 1e3, np.real( data_filt[i, :] ), 'b', linewidth = 0.4 )
+            plt.plot( ( i * tE * 1e-6 + echo_space ) * 1e3, np.imag( data_filt[i, :] ), 'r', linewidth = 0.4 )
+        
+        if sav_indv_dat:
+            for i in range ( 0, NoE ):
+                data_parser.write_text_append_row( data_folder, "\\decay_filt.txt", np.real( data_filt[i, :] ) )
+                data_parser.write_text_append_row( data_folder, "\\decay_filt.txt", np.imag( data_filt[i, :] ) )
+
+        plt.legend()
+        plt.title( 'Filtered data' )
+        plt.xlabel( 'Time (mS)' )
+        if (unit__uvolt_or_digit): # use either microvolt or digit (adc output) unit
+            plt.ylabel( 'probe voltage (uV)' )
+        else:
+            plt.ylabel( 'adc out (digit)' )
+        plt.savefig( data_folder + '\\decay_filt_%06d.png' % expt_num )
+        if sav_as_pdf:
+            plt.savefig( data_folder + '\\decay_filt_%06d.pdf' % expt_num, format='pdf' )
+
+    # find echo average, echo magnitude
+    echo_avg = np.zeros( SpE, dtype = complex )
+    for i in range( ignore_echoes, NoE ):
+        echo_avg += ( data_filt[i, :] / NoE )
+    echo_avg_rms = np.sqrt(np.sum(np.multiply(np.abs(echo_avg),np.abs(echo_avg)))) # find the rms value
+
+
+
+
+    # process spectrum (enable only when en_fit is required)
+    fpeak = 0
+    #if en_fit:
+    zf = 1000  # zero filling factor to get smooth curve. Factor 1 means the resulting vector length is added by the amount of the original vector length itself.
+    spect_xlim_fact = 10 # range of the spectrum to be shown (higher number means larger spectrum bandwidth)
+    if zf>0: # process zero filling
+        ws = 2 * np.pi / ( tacq[1] - tacq[0] )  # in MHz
+        wvect = np.linspace( -ws / 2, ws / 2, len( tacq ) * zf )
+        echo_zf = np.zeros( zf * len( echo_avg ), dtype = complex )
+        echo_zf[int( ( zf / 2 ) * len( echo_avg ) - len( echo_avg ) / 2 ): int( ( zf / 2 ) * len( echo_avg ) + len( echo_avg ) / 2 )] = echo_avg
+        spect = zf * ( np.fft.fftshift( np.fft.fft( np.fft.ifftshift( echo_zf ) ) ) )
+        spect = spect / len( spect )  # normalize the spectrum
+    else: #ignore zero filling
+        ws = 2 * np.pi / ( tacq[1] - tacq[0] )  # in MHz
+        wvect = np.linspace( -ws / 2, ws / 2, len( tacq ) )
+        spect =  ( np.fft.fftshift( np.fft.fft( np.fft.ifftshift( echo_avg ) ) ) )
+        spect = spect / len(spect)
+    # calculate peak frequency
+    fpeak = wvect[np.abs( np.real( spect ) ) == max( np.abs( np.real( spect ) ) )][0] / ( 2 * np.pi ) * 1e3; # calculate the peak frequency offset in kHz
+
+
+
+
+
+
+    if sav_fig:  # plot echo shape
+        plt.figure( 3 )
+        plt.clf()
+        # plt.plot( tacq, np.real( echo_avg ), '--', label = 'real' )
+        plt.plot( tacq, np.real( echo_avg ), '-', label = 'real', linewidth = 3 )
+        # plt.plot( tacq, np.imag( echo_avg ), '--', label = 'imag' )
+        plt.plot( tacq, np.imag( echo_avg ), '-', label = 'imag', linewidth = 3 )
+        #plt.plot( tacq, np.abs( echo_avg ), label = 'abs' )
+        plt.xlim( 0, max( tacq ) )
+        plt.title( "Echo Shape" + " %06d" % phenc_conf.p90_us )
+        plt.xlabel( 'time(uS)' )
+        if (unit__uvolt_or_digit): # use either microvolt or digit (adc output) unit
+            plt.ylabel( 'probe voltage (uV)' )
+        else:
+            plt.ylabel( 'adc out (digit)' )
+        plt.legend()
+        plt.savefig( data_folder + '\\echo_shape_%06d.png' % expt_num )
+        if sav_as_pdf:
+            plt.savefig( data_folder + '\\echo_shape_%06d.pdf' % expt_num, format='pdf' )
+        
+        if sav_indv_dat:
+            data_parser.write_text_overwrite( data_folder, "\\echo_shape.txt", "format: abs, real, imag, time_us" )
+            data_parser.write_text_append_row( data_folder, "\\echo_shape.txt", np.abs( echo_avg ) )
+            data_parser.write_text_append_row( data_folder, "\\echo_shape.txt", np.real( echo_avg ) )
+            data_parser.write_text_append_row( data_folder, "\\echo_shape.txt", np.imag( echo_avg ) )
+            data_parser.write_text_append_row( data_folder, "\\echo_shape.txt", tacq )
+
+        # plot echo spectrum
+        plt.figure( 4 )
+        plt.clf()
+        
+            
+        # plt.plot( wvect / ( 2 * np.pi ), np.real( spect ), '--', label = 'real' )
+        plt.plot( wvect / ( 2 * np.pi ), np.real( spect ), '-', linewidth = 3, label = 'real' )
+        # plt.plot( wvect / ( 2 * np.pi ), np.imag( spect ), '--', label = 'imag' )
+        plt.plot( wvect / ( 2 * np.pi ), np.imag( spect ), '-', linewidth = 3, label = 'imag' )
+        # plt.plot( wvect / ( 2 * np.pi ), np.abs( spect ), label = 'abs' )
+        plt.xlim( spect_xlim_fact / max( tacq ) * -1, spect_xlim_fact / max( tacq ) * 1 )
+        plt.title( "Echo spectrum. " + "Peak:real@{:0.2f}kHz,abs@{:0.2f}kHz".format( wvect[np.abs( np.real( spect ) ) == max( np.abs( np.real( spect ) ) )][0] / ( 2 * np.pi ) * 1e3, wvect[np.abs( spect ) == max( np.abs( spect ) )][0] / ( 2 * np.pi ) * 1e3 ) )
+        # plt.title( "Echo spectrum. " + "Peak: {:0.2f} kHz".format( fpeak ))
+        plt.xlabel( 'offset frequency (MHz)' )
+        plt.ylabel( 'Echo amplitude (a.u.)' )
+        plt.legend()
+        plt.savefig( data_folder + '\\echo_spect_%06d.png' % expt_num )
+        if sav_as_pdf:
+            plt.savefig( data_folder + '\\echo_spect_%06d.pdf' % expt_num, format='pdf' )
+        
+        if sav_indv_dat:
+            data_parser.write_text_overwrite( data_folder, "\\echo_spect.txt", "format: real, imag, freq_MHz" )
+            data_parser.write_text_append_row( data_folder, "\\echo_spect.txt", np.real( spect ) )
+            data_parser.write_text_append_row( data_folder, "\\echo_spect.txt", np.imag( spect ) )
+            data_parser.write_text_append_row( data_folder, "\\echo_spect.txt", wvect / ( 2 * np.pi ) )
+
+    # matched filtering
+    a = np.zeros( NoE, dtype = complex )
+    for i in range( 0, NoE ): # do for every echo            
+        if en_ext_matchfilter: # enable external matched-filtering
+            if en_conj_matchfilter: # enable conjugate filtering
+                # find amplitude with reference echo
+                # a[i] = np.mean( data_filt[i, mtch_fltr_sta_idx:SpE] ) # simple echo average
+                # a[i] = np.sqrt(np.mean( np.multiply( data_filt[i, mtch_fltr_sta_idx:SpE], np.conj( echoref_avg[mtch_fltr_sta_idx:SpE] ) ) ) ) # sqrt(echo*echo_conjugate) --- wrong! because the echo average is a constant multiplier that does not change T2, but sqrt changes T2.
+                a[i] = np.mean( np.multiply( data_filt[i, mtch_fltr_sta_idx:SpE], np.conj( echoref_avg[mtch_fltr_sta_idx:SpE] / np.max(np.abs(echoref_avg[mtch_fltr_sta_idx:SpE]))) ) ) # echo*echo_conjugate
+            else:
+                # find amplitude with reference echo
+                # a[i] = np.mean( data_filt[i, mtch_fltr_sta_idx:SpE] ) # simple echo average
+                a[i] = np.mean( np.multiply( data_filt[i, mtch_fltr_sta_idx:SpE], np.abs( echoref_avg[mtch_fltr_sta_idx:SpE] / np.max(np.abs(echoref_avg[mtch_fltr_sta_idx:SpE]))) ) )
+                
+        else: # use self-filtering
+            if en_conj_matchfilter: # enable conjugate filtering
+                # find amplitude with echo average
+                # a[i] = np.mean( data_filt[i, mtch_fltr_sta_idx:SpE] ) # simple echo average
+                # a[i] = np.sqrt(np.mean(np.multiply( data_filt[i, mtch_fltr_sta_idx:SpE], np.conj( echo_avg[mtch_fltr_sta_idx:SpE] ) ) ) )  # sqrt(echo*echo_conjugate) --- wrong! because the echo average is a constant multiplier that does not change T2, but sqrt changes T2.
+                a[i] = np.mean( np.multiply( data_filt[i, mtch_fltr_sta_idx:SpE], np.conj( echo_avg[mtch_fltr_sta_idx:SpE] / np.max(np.abs(echo_avg[mtch_fltr_sta_idx:SpE])) ) ) )  # (echo*normalize(echo_conjugate))
+                # a[i] = np.mean( np.multiply( data_filt[i, mtch_fltr_sta_idx:SpE], np.conj( echo_avg[mtch_fltr_sta_idx:SpE] / echo_avg_rms ) ) )  # (echo*normalize(echo_conjugate))
+            else:
+                # find amplitude with echo average
+                # a[i] = np.mean( data_filt[i, mtch_fltr_sta_idx:SpE] ) # simple echo average
+                a[i] = np.mean( np.multiply( data_filt[i, mtch_fltr_sta_idx:SpE], np.abs( echo_avg[mtch_fltr_sta_idx:SpE] / np.max(np.abs(echo_avg[mtch_fltr_sta_idx:SpE])) ) ) )  # (echo*normalize(echo_conjugate))     
+           
+                
+                
+    # compute asum
+    #asum_re = np.sum( np.real( a[ignore_echoes:] ) )
+    # asum_re = np.sum( np.abs( np.real( a[ignore_echoes:] ) ) ) # does not work. Caused a weird image output
+    #asum_im = np.sum( np.imag( a[ignore_echoes:] ) )
+    # asum_im = np.sum( np.abs( np.imag( a[ignore_echoes:] ) ) ) # does not work. Caused a weird image output
+    # calculate amplitude sum
+    if not en_spect_ref: # by default, spectrum reference is not being used
+        asum_re = np.sum( np.real( a[ignore_echoes:] ) )
+        asum_im = np.sum( np.imag( a[ignore_echoes:] ) )
+    else:
+        spect_compensator = (-spect_ref + 2*max(spect_ref)) # set the amplitude of the spectrum reference. And make sure that it does not amplify the noise part too much
+        spect = spect *spect_compensator
+        asum_re = np.sum(np.real(spect)) 
+        asum_im = np.sum(np.imag(spect))
+    
+    def dual_exp_func(x, a0, t2a, a1, t2b): # dual exponential
+        return a0 * np.exp(-1/t2a * x) + a1 * np.exp(-1/t2b * x)
+    def single_exp_func( x, a0, t2 ): # single exponential
+        return a0 * np.exp( -1/t2 * x )
+    def multiexp_func (x, *a_t2_list): # multi-exponential fitting
+        f = 0
+        n = len(a_t2_list)
+        for ii in range(n>>1):
+            f = f + a_t2_list[ii] * np.exp(-1/a_t2_list[ii+(n>>1)]*x)
+        return f 
+    
+    # set the container for data fit and try fitting the data
+    a0 = np.zeros(len(a_est), dtype=float)
+    T2 = np.zeros(len(t2_est), dtype=float)
+    f = 0
+    noise = 0
+    res = 0
+    snr = 0
+    snr_res = 0
+    snr_imag = 0
+    
+    if en_fit:
+        try:  # try fitting data
+    
+            popt, pocv = curve_fit (multiexp_func, t_echospace[ignore_echoes:], np.real(a[ignore_echoes:]), [a_est, t2_est])
+            a0 = popt[:len(a_est)]
+            T2 = popt[len(a_est):]
+            
+            f = multiexp_func (t_echospace, *popt)
+            noise = np.std( np.imag( a[ignore_echoes:] ) )
+            res = np.std( np.real( a[ignore_echoes:] ) - f[ignore_echoes:] )
+            snr_imag = np.sum(a0) / ( noise * math.sqrt( total_scan ) )
+            snr_res = np.sum(a0) / ( res * math.sqrt( total_scan ) )
+            snr = snr_imag
+            
+            if sav_fig:
+                # plot fitted line
+                plt.figure( 5 )
+                plt.clf()
+                plt.cla()
+                plt.plot( t_echospace * 1e3, f,  label = "fit",  linewidth = 3 )  # plot in milisecond
+                plt.plot( t_echospace * 1e3, np.real( a ) - f, label = "residue" )
+    
+        except:
+            print( '     Problem in fitting. Set a0 and T2 output to 0' )
+
+    if sav_fig:
+        # plot data
+        plt.figure( 5 )
+        plt.plot( t_echospace * 1e3, np.real( a ), '-', label = "real" , linewidth = 1.5) # plot in milisecond
+        plt.plot( t_echospace * 1e3, np.imag( a ), '-', label = "imag", linewidth = 1.5 ) # plot in milisecond
+
+        # plt.set(gca, 'FontSize', 12)
+        plt.legend()
+        plt.title( 'Matched filtered data. SNRim:{:03.2f} SNRres:{:03.2f}.\na:{:s} n_im:{:0.2f} n_res:{:0.2f} T2:{:s}msec'.format( snr, snr_res, np.array_str(a0,precision=2), ( noise * math.sqrt( total_scan ) ), ( res * math.sqrt( total_scan ) ), np.array_str(T2*1e3,precision=2) ) )
+        # plt.title( 'Matched filtered data. SNR:{:03.2f}.\na:{:s} n:{:0.2f} T2:{:s}msec'.format( snr_res, np.array_str(a0,precision=2), ( res * math.sqrt( total_scan ) ), np.array_str(T2*1e3,precision=2) ) )
+
+        
+        plt.xlabel( 'Time (mS)' )
+        if (unit__uvolt_or_digit): # use either microvolt or digit (adc output) unit
+            plt.ylabel( 'probe voltage (uV)' )
+        else:
+            plt.ylabel( 'adc out (digit)' )
+        plt.savefig( data_folder + '\\decay_sum_%06d.png' % expt_num )
+        if sav_as_pdf:
+            plt.savefig( data_folder + '\\decay_sum_%06d.pdf' % expt_num, format='pdf' )
+        
+        if sav_indv_dat:
+            data_parser.write_text_overwrite( data_folder, "\\decay_sum.txt", "output params: noise std: %0.5f, res std: %0.5f, snr_imag: %0.3f, snr_res: %0.3f, a0: %s, T2: %s ms. Format: a_real, a_imag, fit, time(s) " % ( noise, res, snr_imag, snr_res, np.array_str(a0,precision=2), np.array_str(T2*1e3,precision=2) ) )          
+            data_parser.write_text_append_row( data_folder, "\\decay_sum.txt", np.real( a ) )
+            data_parser.write_text_append_row( data_folder, "\\decay_sum.txt", np.imag( a ) )
+            data_parser.write_text_append_row( data_folder, "\\decay_sum.txt", f )
+            data_parser.write_text_append_row( data_folder, "\\decay_sum.txt", t_echospace )
+
+    if show_fig and sav_fig:
+        plt.show()
+    
+    if en_fit:
+        print( 'a0 = %s' % np.array_str(a0,precision=2))
+        print( 'T2 = %s ms' % np.array_str(T2*1e3,precision=2))
+        print( 'SNR/echo/scan = ' + 'imag:{0:.2f}, res:{1:.2f}'.format( snr, snr_res ) )
+    
+    return ( a, asum_re, asum_im, a0, snr, T2, noise, res, theta, data_filt, echo_avg, t_echospace, fpeak, spect, wvect )
+
+#------------------Cheng------------
+def compute_multiexp_anc( nmrObj, phenc_conf, expt_num, sav_fig, show_fig):
+    
+    # several options are commented in lines below. Check them for different kind of options in plots.
+    
+    # variables to be input
+    # data_parent_folder : the folder for all datas
+    # meas_folder        : the specific folder for one measurement
+    # show_fig            : enable figure
+    # sav_fig = False  # compute the figure and save the figure to file. To show it in runtime, enable the show_fig
+    # en_ext_rotation      : enable external reference for rotation angle
+    # thetaref          : external parameter : rotation angle
+    # en_conj_matchfilter    : when true, matchfilter is computed with conjugate of the echo_avg. When false, matchfilter is computed only with amplitude of the echo_avg, so no rotation will be performed
+    # en_ext_matchfilter : enable external reference for matched filtering
+    # echoref_avg        : external parameter : echo average reference
+    # ignore_echoes     : ignore initial echoes for calculation of echo_avg, T2 fitting, and SNR. It's still being shown in the plot to keep the information.
+    # spect_ref        : spectrum reference
+
+
+    # data_folder = ( data_parent_folder + '/' + meas_folder + '/' )
+    data_folder = nmrObj.client_data_folder + nmrObj.folder_extension
+    
+    # load variables from phenc configs
+    en_ext_rotation = phenc_conf.en_ext_rotation
+    en_self_rotation = phenc_conf.en_self_rotation # perform rotation to the data -> required for reference data for t1 measurement
+    thetaref = phenc_conf.thetaref
+    en_conj_matchfilter = phenc_conf.en_conj_matchfilter
+    en_ext_matchfilter = phenc_conf.en_ext_matchfilter
+    echoref_avg = phenc_conf.echoref_avg
+    dconv_lpf_ord = phenc_conf.dconv_lpf_ord
+    dconv_lpf_cutoff_kHz = phenc_conf.dconv_lpf_cutoff_kHz
+    ignore_echoes = phenc_conf.ignore_echoes
+    a_est = phenc_conf.a_est
+    t2_est = phenc_conf.t2_est
+    dconv_f = phenc_conf.dconv_f
+    
+    # spectrum reference
+    en_spect_ref = phenc_conf.en_spect_ref
+    spect_ref = phenc_conf.spect_ref
+    
+    en_fit = phenc_conf.en_fit
+    
+    # variables local to this function the setting file for the measurement
+    mtch_fltr_sta_idx = 0  # 0 is default or something referenced to SpE, e.g. SpE/4; the start index for match filtering is to neglect ringdown part from calculation 
+    proc_indv_data = False # process individual raw data, otherwise it'll load a sum file generated by C
+    binary_OR_ascii = True # put 1 if the data file uses binary representation, otherwise it is in ascii format
+    float_OR_int32 = True # put 1 if the data file uses float representation, otherwise it is in int32 format
+    unit__uvolt_or_digit = False # set to 0 of ADC digit unit, or 1 for microvolt unit for all the plot
+    # update 12/11/2014
+    sel_adc_ch = 0 # select the adc channel # for NMR to be processed
+    
+    sel_noise_ch = 1 # select the adc channel # for NMR to be processed
+    
+    sav_indv_dat = False # save individual computed data
+    sav_as_pdf = False # save the data as a pdf file
+    
+    # font size on figures
+    plt.rcParams.update({'font.size': 14})
+    
+    # file name prefix for individual data
+    file_name_prefix = 'dat_'
+    
+    # variables from NMR settings
+    ( param_list, value_list ) = data_parser.parse_info( data_folder, 'acqu_%06d.par' % expt_num )  # read file
+    SpE = int( data_parser.find_value( 'nrPnts', param_list, value_list ) )
+    NoE = int( data_parser.find_value( 'nrEchoes', param_list, value_list ) )
+    en_ph_cycle_proc = int (data_parser.find_value( 'usePhaseCycle', param_list, value_list ))
+    tE = data_parser.find_value( 'echoTimeRun', param_list, value_list )
+    Sf = data_parser.find_value( 'adcFreq', param_list, value_list ) * 1e6
+    nrChannels = int( data_parser.find_value( 'adcChannels', param_list, value_list ) )
+    if (dconv_f>0): # set the Df to dconv_f if it's set to a particular value, or get the Df from B1 excitation if it's not set (0).
+        Df = dconv_f * 1e6
+    else:  
+        Df = data_parser.find_value( 'b1Freq', param_list, value_list ) * 1e6 
+        # Df = Df + proc_shift_kHz*1e3 # shift the processing
+    total_scan = int( data_parser.find_value( 'nrIterations', param_list, value_list ) )
+    echo_skip = data_parser.find_value( 'echoSkipHw', param_list, value_list )
+
+    # account for skipped echoes
+    NoE = int( NoE / echo_skip )
+    tE = tE * echo_skip
+
+    # time domain for plot
+    tacq = ( 1 / Sf ) * 1e6 * np.linspace( 1, SpE, SpE )  # in uS
+    t_echospace = tE / 1e6 * np.linspace( 1, NoE, NoE )  # in uS
+
+    if ( proc_indv_data ):
+        # read all datas and average it
+        data = np.zeros( NoE * SpE )
+        for m in range( 1, total_scan + 1 ):
+            file_path = ( data_folder + file_name_prefix +
+                         '{0:03d}'.format( m ) )
+            # read the data from the file and store it in numpy array
+            # format
+            one_scan_multch = np.array( data_parser.read_data( file_path ) )
+            
+            # remove anything else but the adc channel selected to be processed
+            one_scan_multch = np.resize(one_scan_multch,(len(one_scan_multch)/nrChannels,nrChannels))
+            
+            # select the channel to be processed
+            one_scan = one_scan_multch[:,sel_adc_ch]
+            noise_scan = one_scan_multch[:,1]
+            
+            # start the processing
+            one_scan = ( one_scan - np.mean( one_scan ) ) / \
+                total_scan  # remove DC component
+            if ( en_ph_cycle_proc ):
+                if ( m % 2 ):  # phase cycling every other scan
+                    data = data - one_scan
+                else:
+                    data = data + one_scan
+            else:
+                data = data + one_scan
+        
+        dataraw = data        
+        
+    else:
+        # read sum data only (the sum data is actually averaged in C program already)
+        file_path = ( data_folder + '\\dsum_%06d.txt' % expt_num )
+        data = np.zeros( NoE * SpE * nrChannels )
+        
+        if float_OR_int32:
+            if binary_OR_ascii:
+                data = data_parser.read_hex_float( file_path )  # use binary representation
+            else:
+                data = np.array( data_parser.read_data( file_path ) ) # use ascii representation
+        else:
+            if binary_OR_ascii:
+                data = data_parser.read_hex_int32 (file_path) # read int32 in binary representation
+            else:
+                data = np.array( data_parser.read_data( file_path ) ) # use ascii representation
+        
+        # remove other channels data and select the adc channel given to be processed
+        data = np.resize(data,(int(len(data)/nrChannels),nrChannels))
+        noise_data = data[:,1]
+        data = data[:,sel_adc_ch]
+
+        dataraw = data
+        noise_dataraw = noise_data
+        data = ( data - np.mean( data ) )
+        noise_data = ( noise_data - np.mean( noise_data ) )
+        
+        #test_data = lms_filter(data, noise_data, mu=0.00005, filter_order=1)
+        #test_data = rls_filter(data, noise_data, delta=0.0001, lam=0.99, filter_order=2)
+        
+        data = np.atleast_2d(data).T  # Convert to 2D array and transpose to match shape (n_samples, n_features)
+        noise_data = np.atleast_2d(noise_data).T  # Similarly for noise_data
+        
+        #adf package
+        filt = pa.filters.FilterNLMS(n=1, mu=0.0001)
+        #filt = pa.filters.FilterNLMS(3, mu=1.)
+        test_data, e, w = filt.run(noise_data, data)
+        data = e
+        
+        echo_space = ( 1 / Sf ) * np.linspace( 1, SpE, SpE )  # in s
+        plt.figure( 999 )
+        plt.clf()
+        for i in range( 1, NoE + 1):
+            # plt.plot(((i - 1) * tE * 1e-6 + echo_space) * 1e3, data[(i - 1) * SpE:i * SpE], linewidth=0.4)
+            plt.plot( ( ( i - 1 ) * tE * 1e-6 + echo_space ) * 1e3, data[( i - 1 ) * SpE:i * SpE], linewidth = 0.4 )
+        plt.title( "Averaged raw  noise data" )
+        plt.xlabel( 'time(ms)' )
+        if (unit__uvolt_or_digit): # use either microvolt or digit (adc output) unit
+            plt.ylabel( 'probe voltage (uV)' )
+        else:
+            plt.ylabel( 'adc out (digit)' )
+        plt.savefig( data_folder + '\\decay_raw_%06d.png' % expt_num )
+        if sav_as_pdf:
+            plt.savefig( data_folder + '\\decay_raw_%06d.pdf' % expt_num, format='pdf' )    
+        
+    # ignore echoes
+    # if ignore_echoes:
+    #    NoE = NoE - ignore_echoes
+    #    data = data[ignore_echoes * SpE:len( data )]
+    
+    if (unit__uvolt_or_digit): # use either microvolt or digit (adc output) unit
+        # compute the probe voltage before gain stage
+        data = data / nmrObj.totGain * nmrObj.uvoltPerDigit
+    
+
+    if sav_fig:  # plot the averaged scan
+        echo_space = ( 1 / Sf ) * np.linspace( 1, SpE, SpE )  # in s
+        plt.figure( 1 )
+        plt.clf()
+        for i in range( 1, NoE + 1 ):
+            # plt.plot(((i - 1) * tE * 1e-6 + echo_space) * 1e3, data[(i - 1) * SpE:i * SpE], linewidth=0.4)
+            plt.plot( ( ( i - 1 ) * tE * 1e-6 + echo_space ) * 1e3, dataraw[( i - 1 ) * SpE:i * SpE], linewidth = 0.4 )
+        plt.title( "Averaged raw data" )
+        plt.xlabel( 'time(ms)' )
+        if (unit__uvolt_or_digit): # use either microvolt or digit (adc output) unit
+            plt.ylabel( 'probe voltage (uV)' )
+        else:
+            plt.ylabel( 'adc out (digit)' )
+        plt.savefig( data_folder + '\\decay_raw_%06d.png' % expt_num )
+        if sav_as_pdf:
+            plt.savefig( data_folder + '\\decay_raw_%06d.pdf' % expt_num, format='pdf' )
+            
+
+        plt.figure( 111 )
+        plt.clf()
+        for i in range( 1, NoE + 1 ):
+            # plt.plot(((i - 1) * tE * 1e-6 + echo_space) * 1e3, data[(i - 1) * SpE:i * SpE], linewidth=0.4)
+            plt.plot( ( ( i - 1 ) * tE * 1e-6 + echo_space ) * 1e3, noise_dataraw[( i - 1 ) * SpE:i * SpE], linewidth = 0.4 )
+        plt.title( "Average filtered data" )
+        plt.xlabel( 'time(ms)' )
+        if (unit__uvolt_or_digit): # use either microvolt or digit (adc output) unit
+            plt.ylabel( 'probe voltage (uV)' )
+        else:
+            plt.ylabel( 'adc out (digit)' )
+        plt.savefig( data_folder + '\\decay_raw_%06d.png' % expt_num )
+        if sav_as_pdf:
+            plt.savefig( data_folder + '\\decay_raw_%06d.pdf' % expt_num, format='pdf' )
+                   
+
+    # raw average data
+    echo_rawavg = np.zeros( SpE, dtype = float )
+    for i in range( ignore_echoes, NoE ):
+        echo_rawavg += ( data[i * SpE:( i + 1 ) * SpE] / (NoE-ignore_echoes) )
+
+    if sav_fig:  # plot echo rawavg
+        plt.figure( 6 )
+        plt.clf()
+        plt.plot( tacq, echo_rawavg, label = 'echo rawavg' )
+        plt.xlim( 0, max( tacq ) )
+        plt.title( "Echo Average (raw)" )
+        plt.xlabel( 'time(uS)' )
+        if (unit__uvolt_or_digit): # use either microvolt or digit (adc output) unit
+            plt.ylabel( 'probe voltage (uV)' )
+        else:
+            plt.ylabel( 'adc out (digit)' )
+        # plt.legend()
+        plt.savefig( data_folder + '\\echo_avg_%06d.png' % expt_num )
+        if sav_as_pdf:
+            plt.savefig( data_folder + '\\echo_avg_%06d.pdf' % expt_num, format='pdf' )
+        
+    if sav_indv_dat: # write echo raw avg
+        data_parser.write_text_overwrite( data_folder, "\\echo_avg.txt", "format: echo_avg, time_us" )
+        data_parser.write_text_append_row( data_folder, "\\echo_avg.txt", echo_rawavg )
+        data_parser.write_text_append_row( data_folder, "\\echo_avg.txt", tacq )
+
+
+    # filter the data
     data_filt = np.zeros( ( NoE, SpE ), dtype = complex )
     for i in range( 0, NoE ):
         data_filt[i, :] = down_conv( data[i * SpE:( i + 1 ) * SpE], i, tE, Df, Sf, dconv_lpf_ord, dconv_lpf_cutoff_kHz * 1e3 )
@@ -335,7 +834,6 @@ def compute_multiexp( nmrObj, phenc_conf, expt_num, sav_fig, show_fig):
         plt.plot( wvect / ( 2 * np.pi ), np.imag( spect ), '-', linewidth = 3, label = 'imag' )
         # plt.plot( wvect / ( 2 * np.pi ), np.abs( spect ), label = 'abs' )
         plt.xlim( spect_xlim_fact / max( tacq ) * -1, spect_xlim_fact / max( tacq ) * 1 )
-        # plt.xlim (-0.1, 0.1) # in MHz
         plt.title( "Echo spectrum. " + "Peak:real@{:0.2f}kHz,abs@{:0.2f}kHz".format( wvect[np.abs( np.real( spect ) ) == max( np.abs( np.real( spect ) ) )][0] / ( 2 * np.pi ) * 1e3, wvect[np.abs( spect ) == max( np.abs( spect ) )][0] / ( 2 * np.pi ) * 1e3 ) )
         # plt.title( "Echo spectrum. " + "Peak: {:0.2f} kHz".format( fpeak ))
         plt.xlabel( 'offset frequency (MHz)' )
@@ -394,10 +892,10 @@ def compute_multiexp( nmrObj, phenc_conf, expt_num, sav_fig, show_fig):
         asum_re = np.sum(np.real(spect)) 
         asum_im = np.sum(np.imag(spect))
     
-    # def dual_exp_func(x, a0, t2a, a1, t2b): # dual exponential
-    #    return a0 * np.exp(-1/t2a * x) + a1 * np.exp(-1/t2b * x)
-    # def single_exp_func( x, a0, t2 ): # single exponential
-    #    return a0 * np.exp( -1/t2 * x )
+    def dual_exp_func(x, a0, t2a, a1, t2b): # dual exponential
+        return a0 * np.exp(-1/t2a * x) + a1 * np.exp(-1/t2b * x)
+    def single_exp_func( x, a0, t2 ): # single exponential
+        return a0 * np.exp( -1/t2 * x )
     def multiexp_func (x, *a_t2_list): # multi-exponential fitting
         f = 0
         n = len(a_t2_list)
@@ -415,15 +913,10 @@ def compute_multiexp( nmrObj, phenc_conf, expt_num, sav_fig, show_fig):
     snr_res = 0
     snr_imag = 0
     
-    # set the upper and lower bounds    
-    bnd_rep = len(a_est)
-    lb = bnd_rep * [a_bnd[0]] + bnd_rep * [t2_bnd[0]]
-    ub = bnd_rep * [a_bnd[1]] + bnd_rep * [t2_bnd[1]]
-    
     if en_fit:
         try:  # try fitting data
     
-            popt, pocv = curve_fit (multiexp_func, t_echospace[ignore_echoes:], np.real(a[ignore_echoes:]), a_est + t2_est, bounds = (lb,ub))
+            popt, pocv = curve_fit (multiexp_func, t_echospace[ignore_echoes:], np.real(a[ignore_echoes:]), [a_est, t2_est])
             a0 = popt[:len(a_est)]
             T2 = popt[len(a_est):]
             
@@ -453,7 +946,7 @@ def compute_multiexp( nmrObj, phenc_conf, expt_num, sav_fig, show_fig):
 
         # plt.set(gca, 'FontSize', 12)
         plt.legend()
-        plt.title( 'Matched filtered data. SNRim:{:03.2f} SNRres:{:03.2f}.\na:{:s} n_im:{:0.2f} n_res:{:0.2f} T2:{:s}msec'.format( snr, snr_res, np.array_str(a0,precision=2), ( noise * math.sqrt( total_scan ) ), ( res * math.sqrt( total_scan ) ), np.array_str(T2*1e3,precision=1) ) )
+        plt.title( 'Matched filtered data. SNRim:{:03.2f} SNRres:{:03.2f}.\na:{:s} n_im:{:0.2f} n_res:{:0.2f} T2:{:s}msec'.format( snr, snr_res, np.array_str(a0,precision=2), ( noise * math.sqrt( total_scan ) ), ( res * math.sqrt( total_scan ) ), np.array_str(T2*1e3,precision=2) ) )
         # plt.title( 'Matched filtered data. SNR:{:03.2f}.\na:{:s} n:{:0.2f} T2:{:s}msec'.format( snr_res, np.array_str(a0,precision=2), ( res * math.sqrt( total_scan ) ), np.array_str(T2*1e3,precision=2) ) )
 
         
@@ -482,6 +975,81 @@ def compute_multiexp( nmrObj, phenc_conf, expt_num, sav_fig, show_fig):
         print( 'SNR/echo/scan = ' + 'imag:{0:.2f}, res:{1:.2f}'.format( snr, snr_res ) )
     
     return ( a, asum_re, asum_im, a0, snr, T2, noise, res, theta, data_filt, echo_avg, t_echospace, fpeak, spect, wvect )
+
+
+def lms_filter(noisy_signal, noise_reference, mu=0.0001, filter_order=1):
+    # Initialize weights for the adaptive filter
+    filter_weights = np.zeros(filter_order)
+    n_samples = len(noisy_signal)
+    
+    # Output signal after noise cancellation
+    output_signal = np.zeros(n_samples)
+    
+    # LMS adaptive filtering
+    for n in range(filter_order, n_samples):
+        # Get the noise reference segment
+        x_n = noise_reference[n:n-filter_order:-1]  # windowed noise signal
+        
+        # Estimate the noise in the noisy signal
+        y_n = np.dot(filter_weights, x_n)
+        
+        # Calculate the error (difference between the desired signal and the estimate)
+        error_n = noisy_signal[n] - y_n
+        
+        # Update the filter weights
+        filter_weights += 2 * mu * error_n * x_n
+        
+        # Save the output signal
+        output_signal[n] = error_n
+    
+    return output_signal
+#------------------Cheng------------
+
+import numpy as np
+
+def rls_filter(noisy_signal, noise_reference, delta=0.001, lam=0.99, filter_order=32):
+    """
+    RLS adaptive filter for active noise cancellation
+    
+    :param noisy_signal: The signal with noise (NMR signal with noise)
+    :param noise_reference: Reference signal containing just noise
+    :param delta: Initialization value for P matrix (typically small)
+    :param lam: Forgetting factor (between 0 and 1, closer to 1 for slower adaptation)
+    :param filter_order: The length of the adaptive filter
+    :return: The denoised signal (xhat)
+    """
+    n_samples = len(noisy_signal)
+    
+    # Initialize filter weights and P matrix
+    w = np.zeros(filter_order)  # Filter weight vector (length = filter_order)
+    P = np.eye(filter_order) / delta  # Initialize P matrix (identity matrix scaled by delta)
+    
+    xhat = np.zeros(n_samples)  # Filtered output
+    
+    for n in range(filter_order, n_samples):
+        # Get the current segment of the noise reference signal (windowed input)
+        x_n = noise_reference[n:n-filter_order:-1]
+        
+        # Compute the a priori error covariance (gain vector)
+        Pi_xn = np.dot(P, x_n)
+        gain = Pi_xn / (lam + np.dot(x_n.T, Pi_xn))
+        
+        # Estimate the signal
+        y_n = np.dot(w, x_n)
+        
+        # Compute the error between the noisy signal and the estimated noise
+        error_n = noisy_signal[n] - y_n
+        
+        # Update the filter weights
+        w = w + gain * error_n
+        
+        # Update the error covariance matrix P
+        P = (P - np.outer(gain, Pi_xn)) / lam
+        
+        # Save the estimated signal
+        xhat[n] = y_n
+    
+    return xhat
 
 def compute_in_bw_noise( en_filt, bw_kHz, filt_ord, Df_MHz, minfreq, maxfreq, data_parent_folder, plotname, en_fig ):
 
@@ -622,9 +1190,7 @@ def plot_noise_multch( minfreq, maxfreq, data_parent_folder, plotname, en_fig ):
     # en_fig            : enable figure
 
     # compute settings
-    plot_time_or_samplenum = True # put 1 if plotting Time, otherwise plotting sample number
-    binary_OR_ascii = False # put 1 if the data file uses binary representation, otherwise it is in ascii format
-    float_OR_int32 = False # put 1 if the data file uses float representation, otherwise it is in int32 format
+    plot_time_or_samplenum = False
 
     data_folder = ( data_parent_folder + '/' )
     fig_num = 200
@@ -638,27 +1204,14 @@ def plot_noise_multch( minfreq, maxfreq, data_parent_folder, plotname, en_fig ):
         'samples', param_list, value_list ) )
     nrChannels = int( data_parser.find_value( 
         'adc_channel', param_list, value_list ) )
-    
 
     # parse file and remove DC component
     nmean = 0
     file_path = ( data_folder + 'noise.txt' )
-    
-    # one_scan_raw = np.array( data_parser.read_data( file_path ) )
-    if float_OR_int32:
-        if binary_OR_ascii:
-            one_scan_raw = data_parser.read_hex_float( file_path )  # use binary representation
-        else:
-            one_scan_raw = np.array( data_parser.read_data( file_path ) ) # use ascii representation
-    else:
-        if binary_OR_ascii:
-            one_scan_raw = data_parser.read_hex_int32 (file_path) # read int32 in binary representation
-        else:
-            one_scan_raw = np.array( data_parser.read_data( file_path ) ) # use ascii representation
-    
+    one_scan_raw = np.array( data_parser.read_data( file_path ) )
     one_scan_raw = np.resize(one_scan_raw,(nrPnts,nrChannels))
     one_scan_raw = np.transpose(one_scan_raw)  
-   
+
     # compute in-bandwidth noise
     Sf = adcFreq * 1e6
     T = 1 / Sf
@@ -695,144 +1248,7 @@ def plot_noise_multch( minfreq, maxfreq, data_parent_folder, plotname, en_fig ):
                 line1, = ax.plot( one_scan_raw[j], 'b-' , linewidth = 0.5 )
             
             if j == nrChannels-1:
-                if plot_time_or_samplenum:
-                    ax.set_xlabel( 'Time(ms)' )
-                else: 
-                    ax.set_xlabel( 'Sample(#)' )
-                ax.set_ylabel( 'Amplitude (a.u.)' )
-                # ax.set_title( "Amplitude. std=%0.2f. mean=%0.2f." % ( nstd, nmean ) )
-            else:
-                ax.axes.get_xaxis().set_visible(False)
-            # ax.grid()
-            
-            # compute fft
-            spectx, specty = nmr_fft( one_scan_raw[j], adcFreq, 0 )
-            fft_range = [i for i, value in enumerate( spectx ) if ( 
-                value >= minfreq and value <= maxfreq )]  # limit fft display
-            
-            ax = fig.add_subplot( nrChannels,nplot,2+j*nplot )
-            line1, = ax.plot( spectx[fft_range], specty[fft_range], 'b-', label = 'data', linewidth = 0.5 )
-            # plt.ylim( [0, 50] )
-            
-            if j == nrChannels-1:
-                ax.set_xlabel( 'Frequency (MHz)' )
-                ax.set_ylabel( 'Amplitude (a.u.)' )
-                # ax.set_title( "Amplitude. std=%0.2f. mean=%0.2f." % ( nstd, nmean ) )
-            else:
-                ax.axes.get_xaxis().set_visible(False)
-            # ax.grid()
-            
-            
-            # plot histogram
-            n_bins = 200
-            ax = fig.add_subplot( nrChannels,nplot,3+j*nplot )
-            n, bins, patches = ax.hist( one_scan_raw[j], bins = n_bins )
-            ax.set_xlabel( 'Histogram' )
-            ax.set_ylabel( 'Amplitude (a.u.)' )
-            #if j == nrChannels-1:
-            #    ax.set_xlabel( 'Histogram' )
-            #    ax.set_ylabel( 'Amplitude (a.u.)' )
-                # ax.set_title( "Histogram" )
-            #else:
-            #    ax.axes.get_xaxis().set_visible(False)
-            # ax.grid()
-            
-
-        # plt.subplot_tool()
-        plt.subplots_adjust(hspace=0)
-        fig.canvas.draw()
-        fig.canvas.flush_events()
-
-        # fig = plt.gcf() # obtain handle
-        plt.savefig( data_folder + plotname )
-
-#======================
-#==Cheng==  
-def plot_noise_multch_avg( minfreq, maxfreq, data_parent_folder, plotname, en_fig ):
-
-    # variables to be input
-    # en_filt            : enable the software post-processing filter to limit the measurement bandwidth
-    # data_parent_folder : the folder for all datas
-    # bw_kHz            : filter bandwidth
-    # filt_ord : filter order
-    # en_fig            : enable figure
-    
-    # compute settings
-    plot_time_or_samplenum = True
-    binary_OR_ascii = False # put 1 if the data file uses binary representation, otherwise it is in ascii format
-    float_OR_int32 = False # put 1 if the data file uses float representation, otherwise it is in int32 format
-
-    data_folder = ( data_parent_folder + '/' )
-    fig_num = 200
-
-    # variables from NMR settings
-    ( param_list, value_list ) = data_parser.parse_info( 
-        data_folder, 'acqu.par' )  # read file
-    adcFreq = data_parser.find_value( 
-        'adcFreq', param_list, value_list )
-    nrPnts = int( data_parser.find_value( 
-        'samples', param_list, value_list ) )
-    nrChannels = int( data_parser.find_value( 
-        'adc_channel', param_list, value_list ) )
-
-    # parse file and remove DC component
-    nmean = 0
-    file_path = ( data_folder + 'noise.txt' )
-    # one_scan_raw = np.array( data_parser.read_data( file_path ) )
-    if float_OR_int32:
-        if binary_OR_ascii:
-            one_scan_raw = data_parser.read_hex_float( file_path )  # use binary representation
-        else:
-            one_scan_raw = np.array( data_parser.read_data( file_path ) ) # use ascii representation
-    else:
-        if binary_OR_ascii:
-            one_scan_raw = data_parser.read_hex_int32 (file_path) # read int32 in binary representation
-        else:
-            one_scan_raw = np.array( data_parser.read_data( file_path ) ) # use ascii representation
-    one_scan_raw = np.resize(one_scan_raw,(nrPnts,nrChannels))
-    one_scan_raw = np.transpose(one_scan_raw)  
-
-    # compute in-bandwidth noise
-    Sf = adcFreq * 1e6
-    T = 1 / Sf
-    t = np.linspace( 0, T * ( len( one_scan_raw[0] ) - 1 ), len( one_scan_raw[0] ) )
-
-
-    if en_fig:
-        plt.ion()
-        fig = plt.figure( fig_num )
-
-        # maximize window
-        plot_backend = matplotlib.get_backend()
-        mng = plt.get_current_fig_manager()
-        if plot_backend == 'TkAgg' or plot_backend == 'tkagg':
-            # mng.resize(*mng.window.maxsize())
-            mng.resize( 1800, 800 )
-        elif plot_backend == 'wxAgg':
-            mng.frame.Maximize( True )
-        elif plot_backend == 'Qt4Agg':
-            mng.window.showMaximized()
-
-        fig.clf()
-        
-        nplot = 3 # the number of plots, i.e., time-domain, freq-domain, histogram
-        spectyArray = np.zeros((nrPnts,nrChannels),dtype=float)
-        for j in range(0,nrChannels):
-            # plot time domain data
-            ax = fig.add_subplot( nrChannels,nplot,1+j*nplot )
-            x_time = np.linspace( 1, len( one_scan_raw[j] ), len(one_scan_raw[j]) )
-            x_time = np.multiply( x_time, ( 1 / adcFreq ) )  # in us
-            x_time = np.multiply( x_time, 1e-3 )  # in ms
-            if plot_time_or_samplenum:
-                line1, = ax.plot( x_time, one_scan_raw[j], 'b-' , linewidth = 0.5 )
-            else:
-                line1, = ax.plot( one_scan_raw[j], 'b-' , linewidth = 0.5 )
-            
-            if j == nrChannels-1:
-                if plot_time_or_samplenum:
-                    ax.set_xlabel( 'Time(ms)' )
-                else: 
-                    ax.set_xlabel( 'Sample(#)' )
+                ax.set_xlabel( 'Time(ms)' )
                 ax.set_ylabel( 'Amplitude (a.u.)' )
                 # ax.set_title( "Amplitude. std=%0.2f. mean=%0.2f." % ( nstd, nmean ) )
             else:
@@ -871,7 +1287,134 @@ def plot_noise_multch_avg( minfreq, maxfreq, data_parent_folder, plotname, en_fi
             #else:
             #    ax.axes.get_xaxis().set_visible(False)
             # ax.grid()
-            spectyArray[:,j] = np.square(specty)
+            
+
+        # plt.subplot_tool()
+        plt.subplots_adjust(hspace=0)
+        fig.canvas.draw()
+        fig.canvas.flush_events()
+
+        # fig = plt.gcf() # obtain handle
+        plt.savefig( data_folder + plotname )
+        
+        #======================
+        #==Cheng==  
+def plot_noise_multch_avg( minfreq, maxfreq, data_parent_folder, plotname, en_fig ):
+
+    # variables to be input
+    # en_filt            : enable the software post-processing filter to limit the measurement bandwidth
+    # data_parent_folder : the folder for all datas
+    # bw_kHz            : filter bandwidth
+    # filt_ord : filter order
+    # en_fig            : enable figure
+    
+    # compute settings
+    plot_time_or_samplenum = False
+
+    data_folder = ( data_parent_folder + '/' )
+    fig_num = 200
+
+    # variables from NMR settings
+    ( param_list, value_list ) = data_parser.parse_info( 
+        data_folder, 'acqu.par' )  # read file
+    adcFreq = data_parser.find_value( 
+        'adcFreq', param_list, value_list )
+    nrPnts = int( data_parser.find_value( 
+        'samples', param_list, value_list ) )
+    nrChannels = int( data_parser.find_value( 
+        'adc_channel', param_list, value_list ) )
+
+    # parse file and remove DC component
+    nmean = 0
+    file_path = ( data_folder + 'noise.txt' )
+    one_scan_raw = np.array( data_parser.read_data( file_path ) )
+    one_scan_raw = np.resize(one_scan_raw,(nrPnts,nrChannels))
+    one_scan_raw = np.transpose(one_scan_raw)  
+
+    # compute in-bandwidth noise
+    Sf = adcFreq * 1e6
+    T = 1 / Sf
+    t = np.linspace( 0, T * ( len( one_scan_raw[0] ) - 1 ), len( one_scan_raw[0] ) )
+
+
+    if en_fig:
+        plt.ion()
+        fig = plt.figure( fig_num )
+
+        # maximize window
+        plot_backend = matplotlib.get_backend()
+        mng = plt.get_current_fig_manager()
+        if plot_backend == 'TkAgg' or plot_backend == 'tkagg':
+            # mng.resize(*mng.window.maxsize())
+            mng.resize( 1800, 800 )
+        elif plot_backend == 'wxAgg':
+            mng.frame.Maximize( True )
+        elif plot_backend == 'Qt4Agg':
+            mng.window.showMaximized()
+
+        fig.clf()
+        
+        nplot = 3 # the number of plots, i.e., time-domain, freq-domain, histogram
+        for j in range(0,nrChannels):
+            # plot time domain data
+            ax = fig.add_subplot( nrChannels,nplot,1+j*nplot )
+            x_time = np.linspace( 1, len( one_scan_raw[j] ), len(one_scan_raw[j]) )
+            x_time = np.multiply( x_time, ( 1 / adcFreq ) )  # in us
+            x_time = np.multiply( x_time, 1e-3 )  # in ms
+            if plot_time_or_samplenum:
+                line1, = ax.plot( x_time, one_scan_raw[j], 'b-' , linewidth = 0.5 )
+            else:
+                line1, = ax.plot( one_scan_raw[j], 'b-' , linewidth = 0.5 )
+                
+                #------Cheng-------------
+                # fix y axis scale
+                
+                if (j == 0):
+                    plt.ylim(1800, 2100)
+                    ax.set_ybound(lower=1800, upper=2100)
+                
+            if j == nrChannels-1:
+                ax.set_xlabel( 'Time(ms)' )
+                ax.set_ylabel( 'Amplitude (a.u.)' )
+                # ax.set_title( "Amplitude. std=%0.2f. mean=%0.2f." % ( nstd, nmean ) )
+            else:
+                ax.axes.get_xaxis().set_visible(False)
+            # ax.grid()
+            
+            # compute fft
+            spectx, specty = nmr_fft( one_scan_raw[j], adcFreq, 0 )
+            fft_range = [i for i, value in enumerate( spectx ) if ( 
+                value >= minfreq and value <= maxfreq )]  # limit fft display
+            
+            ax = fig.add_subplot( nrChannels,nplot,2+j*nplot )
+            line1, = ax.plot( spectx[fft_range], specty[fft_range], 'b-', label = 'data', linewidth = 0.5 )
+            # plt.ylim( [0, 50] )
+            
+            if j == nrChannels-1:
+                ax.set_xlabel( 'Frequency (MHz)' )
+                ax.set_ylabel( 'Amplitude (a.u.)' )
+                # ax.set_title( "Amplitude. std=%0.2f. mean=%0.2f." % ( nstd, nmean ) )
+                #plt.ylim( [0, 4] )
+            else:
+                ax.axes.get_xaxis().set_visible(False)
+            # ax.grid()
+            
+            
+            # plot histogram
+            n_bins = 200
+            ax = fig.add_subplot( nrChannels,nplot,3+j*nplot )
+            n, bins, patches = ax.hist( one_scan_raw[j], bins = n_bins )
+            ax.set_xlabel( 'Histogram' )
+            ax.set_ylabel( 'Amplitude (a.u.)' )
+            #if j == nrChannels-1:
+            #    ax.set_xlabel( 'Histogram' )
+            #    ax.set_ylabel( 'Amplitude (a.u.)' )
+                # ax.set_title( "Histogram" )
+            #else:
+            #    ax.axes.get_xaxis().set_visible(False)
+            # ax.grid()
+            if j == 0:
+                spectyArray = specty
             
         # plt.subplot_tool()
         plt.subplots_adjust(hspace=0)
@@ -881,7 +1424,7 @@ def plot_noise_multch_avg( minfreq, maxfreq, data_parent_folder, plotname, en_fi
         # fig = plt.gcf() # obtain handle
         plt.savefig( data_folder + plotname )
         
-        return spectx, spectyArray
+        return spectx, np.square(spectyArray)
      #======================    
 
 def calcP90( Vpp, rs, L, f, numTurns, coilLength, coilFactor ):
@@ -911,4 +1454,3 @@ def calcP90( Vpp, rs, L, f, numTurns, coilLength, coilFactor ):
     Pwatt = ( Irms ** 2 ) * rs
 
     return P90, Pwatt
-
