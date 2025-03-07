@@ -10,7 +10,7 @@ from datetime import datetime
 import os
 import shutil
 
-# import pydevd
+import pydevd
 
 from nmr_std_function.ntwrk_functions import exec_rmt_ssh_cmd_in_datadir, init_ntwrk, exit_ntwrk
 import numpy as np
@@ -30,18 +30,18 @@ class nmr_system_2022:
         self.dconv_gain = 0.707106781  # downconversion gain factor due to sine(45,135,225,315) multiplication
 
         # ip addresses settings for the system
-        self.server_ip = '192.168.14.204'  # '129.22.143.88'
-        self.client_ip = '192.168.14.105'  # '129.22.143.39'
-        self.server_path = '/root'
+        self.server_ip = '192.168.137.10'  # '129.22.143.88'
+        self.client_ip = '192.168.137.1' # '129.22.143.39'
+        self.server_path = '/root/sambashare'
         # client path with samba
-        self.client_path = 'W:\\'
+        self.client_path = 'Z:\\'
         self.ssh_usr = 'root'
-        self.ssh_passwd = 'dave'
+        self.ssh_passwd = ''
         # data folder
         self.server_data_folder = "/root/NMR_DATA"
         self.client_data_folder = client_data_folder
         self.folder_extension = "" # folder extension for the measurement
-        self.exec_folder = "c_exec"
+        self.exec_folder = "c_temp"
 
         # configure the network
         self.ssh, self.scp = init_ntwrk ( self.server_ip, self.ssh_usr, self.ssh_passwd )
@@ -205,21 +205,6 @@ class nmr_system_2022:
         ssh_cmd = self.server_path +'/'+ self.exec_folder +'/'+ command
         exec_rmt_ssh_cmd_in_datadir( self.ssh, ssh_cmd, self.server_data_folder )
      
-    def noise_timeavg( self, f_adc, samples, avg_fact, vvarac ):
-        # execute cpmg sequence
-        exec_name = "noise_timeavg"
-
-        command = ( exec_name + " " +
-                   str( f_adc ) + " " +
-                   str( samples ) + " " +
-                   str( avg_fact ) + " " +
-                   str ( vvarac ) + " " +
-                   "0 0 0" # data input mode
-                   )
-    
-        ssh_cmd = self.server_path +'/'+ self.exec_folder +'/'+ command
-        exec_rmt_ssh_cmd_in_datadir( self.ssh, ssh_cmd, self.server_data_folder )
-        
     def noise( self, f_adc, samples, vvarac ):
         # execute cpmg sequence
         exec_name = "noise"

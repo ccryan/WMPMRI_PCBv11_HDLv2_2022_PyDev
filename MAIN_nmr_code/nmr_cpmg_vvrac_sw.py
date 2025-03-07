@@ -13,6 +13,7 @@ from datetime import datetime
 import pydevd
 from scipy import signal
 import matplotlib.pyplot as plt
+import numpy as np
 
 from nmr_std_function.data_parser import parse_csv_float2col
 from nmr_std_function.data_parser import parse_simple_info
@@ -54,9 +55,32 @@ phenc_conf = phenc_conf_halbach_v06_230503_test()
 phenc_conf.en_fit = True
 #phenc_conf.a_est = [20] # array of amplitude estimate for fitting
 #phenc_conf.t2_est = [40e-3] # array of t2 estimate for fitting
+#----------------
+# sweep vvarctor
+val_sw = np.linspace(-2.0, -0.5, 16)
+echo_avg_rms_list = np.zeros(len(val_sw));
 
-# run the experiment
-cpmg(nmrObj, phenc_conf, expt_num, sav_fig, show_fig)
+for i,val_curr in enumerate(val_sw):
+    
+    if (i==len(val_sw)-1):
+        phenc_conf.en_lcs_dchg = 1 # enable discharging at the last iteration to dump vpc voltage
+    
+    print("\t\t\t\texpt: %d/%d ----- varactor voltage = %0.10f V" % (i,len(val_sw)-1,val_curr) )
+    phenc_conf.vvarac = val_curr
+    expt_num = i
+    
+    # run the experiment
+    asum_re, asum_im, a0, snr, T2, noise, res, theta, echo_avg, fpeak, spect, wvect = cpmg(nmrObj, phenc_conf, expt_num, sav_fig, show_fig)
+    echo_avg_rms_list[i] =  snr
+    time.sleep(1)
+
+plt.figure( 10 )
+plt.clf()
+plt.plot( val_sw, echo_avg_rms_list )
+plt.legend()
+plt.title( 'Varactor Sweep' )
+plt.xlabel( 'Voltage (V)' )
+plt.savefig( nmrObj.client_data_folder + '\\vvarc_sweep.png' )
 
 tmeas.reportTimeSinceLast("### processing")
 
